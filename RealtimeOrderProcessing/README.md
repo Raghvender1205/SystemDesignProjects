@@ -137,7 +137,7 @@ flowchart LR
     A[Client] --> B[gRPC/REST]
     B --> C[API Gateway]
 ```
-User taps on 'place order', the client sends an `HTTP/2` request using `gRPC`(mobiles), `HTTP`(browsers). Every request is encrypted over TLS
+User taps on 'place order', the client sends an `HTTP/2` request using `gRPC`(mobiles), `HTTP`(browsers). Every request is encrypted over TLS. We use golang's gRPC package for this.
 
 Client also generates an <b>idempotency key</b> - random UUID and attaches it to every request. If the network drops and client retries, this key lets the server recognize the duplicate and return the original result instead of placing the order <b>twice</b>
 
@@ -156,7 +156,9 @@ It is a single public facing entry point. Before any request touches the busines
 - Rate limiting:- Each customer is capped at a configurable request rate (e.b 100 req/s). This prevents a single bad actor or client from flooding the Order Service. Response above the limit get `429 Too many Requests`.
 - Routing:- Based on the path and headers, the gateway routes the request to the correct upstream - in this case `Order Service`. In other largers systems, API Gateway also handles `A/B` routing, canary splits and header injection
 
-The gateway also terminates TLS, so internal services communicate over plaintext within the cluster - simplifying mTLS configuration for internal hops.
+The gateway also terminates TLS, so internal services communicate over plaintext within the cluster - simplifying mTLS configuration for internal hops. 
+
+In Golang, `net/http` handles concurrency with goroutines per connection - no thread pool configuration needed. Each request gets its own goroutine, context-cancelled on client disconnect.
 
 ### Order Service
 ```mermaid
@@ -175,6 +177,18 @@ This is the first piece of business logic. It recieves the authenticated, rate-l
 - Serialises to Protobuf:- The order is encoded as binary Protobuf message according to the schema in the Schema Registry. The binary payload is then handled to the Kafka Producer.
 
 HTTP Response is `202 Accepted` returned immediately after the Kafka publish is acknowledged. The customer does not wait for payment, that happens asynchronously downstream
+
+Example of Protobuf schema
+```go
+type Order struct {
+    OrderId        string       `validate:"required,uuid"`
+    CustomerId     string       `validate:"required"`
+    IdempotencyKey string       `validate:"required,uuid"`
+    Items          []LineItem
+}
+```
+
+All operations carry a context, with a `deadline`. If a kafka publish exceeds the deadline, the context is cancelled and the request fails fast - no goroutine leaks.
 
 ### Kafka Producer
 ```mermaid
@@ -205,6 +219,18 @@ batch.size = 32768
 linger.ms = 5
 ```
 
+in Golang, using `github.com/confluentinc/confluent-kafka-go/kafka`, it can be configured like this
+
+```go
+p, _ := kafka.NewProducer(&kafka.ConfigMap{
+    "bootstrap.servers":  brokers,
+    "acks":               "all",
+    "enable.idempotence": true,
+    "compression.type":   "snappy",
+    "linger.ms":          5,
+})
+```
+
 `acks=all` means the producer waits for the leader broker AND all in-sync replicas to acknowledge the write before returning success. This is the strongest possbile durability guarantee -- the write survives any single broker failure.
 
 `enable.idempotence=true` assigns each producer a unique Producer ID and tags each message with a monotonically increasing sequence number. If a message is sent twice due to a retry (the ack was lost on the network), the broker detects the duplicate sequence number and silently discards it. Exactly-once delivery at the producer level, built into Kafka.
@@ -212,6 +238,8 @@ linger.ms = 5
 `snappy compression` reduces messages size by ~40-60% with minimal CPU overhead - important at high throughput
 
 `linger.ms = 5` waits up to 5ms for more messages before sending a batch. This trades a tiny bit of latency for much higher throughput at peak load.
+
+Delivery reports arrive on a Go channel (`p.Events()`). A goroutine drains this channel and logs errors - never block the publish path waiting for delivery confirmation synchronously
 
 ### Kafka cluster
 ```mermaid
@@ -248,3 +276,325 @@ flowchart LR
 Schema registry stores all Protobuf schema definitions and enforces compatibility rules. Every time a producer publishes a message, it registers the schema (or validates against the existing one). Every consumer uses the registry to deserialise the binary payload correctly.
 
 The key feature is `backward compatibility enforcement`. If a developer tries to publish a schema change that would break existing consumers - for example, removing a required field or changing a field type - the registry rejects the schema registration before the code ever reaches production. So, for example a v2 producer publishing a new optional fields won't break a v1 consumer that's still reading the old schema - Protobuf ignores unknown fields. Zero-downtime schema evolution.
+
+## 2. Consumers and SAGA 
+How 4 independent services fan out from the Kafka event, how SAGA orchestrator coordinates distributed transactions and how KEDA keeps them scaled to demand.
+
+### Payment Consumer
+
+```mermaid
+flowchart LR
+    A[Kafka] --> B[Redis Idempotency Check]
+    B --> C[Circuit breker]
+    C --> D[Razorpay /v1/orders]
+    D --> E[Verify HMAC]
+    E --> F[Razorpay capture]
+    F --> G[pgx write]
+    G --> H[CommitMessage]
+```
+
+Payment consumer is a go binary consuming `orders.created`. It is the most critical service in the system -  a mistake here double-charges or loses a payment 
+
+Circuit breaker in Go uses `github.com/sony/gobreaker`. The breaker wraps both RazorPay API calls
+```go
+cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+    Name:        "razorpay",
+    MaxRequests: 3,
+    Interval:    30 * time.Second,
+    Timeout:     60 * time.Second,
+    ReadyToTrip: func(counts gobreaker.Counts) bool {
+        failRatio := float64(counts.TotalFailures) /
+                     float64(counts.Requests)
+        return counts.Requests >= 5 && failRatio >= 0.5
+    },
+})
+```
+
+If RazorPay's error rate exceeds 50%, over 30 seconds, the circuit opens - the consumer publishes a failure event instead of calling RazorPay, triggering SAGA orchestration. It half opens after 60 seconds to probe recovery.
+
+Razorpay's two-step flow: first `/v1/orders` to create the razorpay order, then `POST /v1/payments/{id}/capture` after authorization. Verify `razorpay_signature` (HMAC-SHA256) before capturing
+
+`Idempotency`, check redis for the order's key before calling razorpay. Kafka offset confirm via `confluent-kafka-go CommitMessage()` only after pgx write succeeds.
+
+Never commit the Kafka offset before completing the downstream write. At-least-once delivery is safe only when processing is idempotent which is why the redis check is the very first step.
+
+
+### Inventory Consumer
+
+```mermaid
+flowchart LR
+    A[kafka] --> B[pgx BEGIN TX]
+    B --> C[reserve stock]
+    C --> D[pgx COMMIT]
+    D --> E[notify SAGA]
+    E --> F[CommitMessage]
+```
+
+A consumer which reads `orders.created` in parallel with the Payment Consumer. Reserves stock by decrementing available counts in Postgres inside a transaction.
+
+Notifies SAGA orchestrator of its outcome. On failure, the SAGA orchestrator publishes a compensation event that triggers a RazorPay refund via the Payment Consumer.
+
+### Notification Consumer
+
+```mermaid
+flowchart LR
+    A[Kafka] --> B[load prefs]
+    B --> C[goroutine: email]
+    C --> D[goroutine: push / SMS]
+    D --> E[WaitGroup.Wait]
+    E --> F[CommitMessage]
+```
+
+A consumer consuming `orders.created, orders.fulfilled`. Sends notifications via HTTP calls to AWS SES (email), FCM (push), or Twilio (SMS) depending on customer preferences.
+
+Go's goroutine model makes fan-out cheap - send email, push and SMS concurrently using `sync.WaitGroup` with per-channel error collection. Total notification time = slowest channel, not sum of all channels.
+
+Notifications are fire-and-forget from the SAGA's perspective. A failed notification never triggers a refund - retried up to 3x then routed to DLQ.
+
+### Audit Consumer
+
+```mermaid
+flowchart LR
+    A[Kafka] --> B[buffer events]
+    B --> C[parquet encode]
+    C --> D[S3 PutObject]
+    D --> E[CommitMessage]
+```
+
+A consumer that reads every order-related topic and writes batched Parquet files to object storage using `parquet-go`. Batches 1000 events or flushes every 30 seconds.
+
+Parquet is columnar and snappy-compressed - a month of events would be 50GB as JSON becomes ~8GB as Parquet, directly querable by Athena/BigQuery
+
+S3 Object Lock in WORM mode prevents deletion by anyone for the configured retention period - required for financial compliance.
+
+### SAGA Orchestrator
+
+```mermaid
+flowchart LR
+    A[Step Success] --> B[pgx UPDATE saga_state]
+    B --> C[next step]
+    C --> D[step fails]
+    D --> E[publish compensation event]
+    E --> F[Razorpay Refund]
+```
+
+A Service that implements a state machine persisted in Postgres. It has state transitions
+
+```go
+type SAGAState string
+const (
+    StatePending    SAGAState = "pending"
+    StatePaid      SAGAState = "paid"
+    StateReserved  SAGAState = "reserved"
+    StateFulfilled SAGAState = "fulfilled"
+    StateRefunding SAGAState = "refunding"
+    StateCancelled SAGAState = "cancelled"
+)
+```
+
+The orchestrator writes its state in the same postgres transaction as the business data - so if process crashes mid-SAGA. It resumes exactly where it left off on restart.
+
+Razorpay compensation is `POST /v1/payments/{id}/refund` - also wrapped in a `sony/gobreaker` circuit breaker.
+
+Every SAGA step must have a compensation. Payment compensation = RazoryPay refund API. Inventory Compensation = release reservation via `pgx UPDATE`. Notification compensation = sends cancellation message
+
+### KEDA AutoScaler
+
+```mermaid
+flowchart LR
+    A[KEDA polls Kafka Lag] --> B{lag > threshold}
+    B -- Yes --> C["ceil(lag/100) replicas"]
+    C --> D[Kubernetes scales Go pods]
+    D --> E[Kafka rebalances partitions]
+```
+
+KEDA watches the Kafka consumer group lag for each Go consumer deployment and scales Kubernetes pods propotionally. Standard HPA scales on CPU, a Go consumer with a backlog of 50,000 messages might be at 2%CPU. KEDA surfaces actual lag as the scaling signal
+
+```yaml
+triggers:
+- type: kafka
+  metadata: 
+    consumerGroup: payment-consumer-group
+    topic: orders.created
+    lagThreshold: "100"
+
+maxReplicaCount: 32 # matches partition count
+```
+
+Go's low memory footprint (`~10-20mb per consumer binary`) means one can scale to 32 pods (one per partition) far more cheaply than equivalent JVM-based consumers
+
+
+## 3. Storage, Pub/Sub and Observability
+### Postgres 18
+
+```mermaid
+flowchart LR
+A[pgx BEGIN] --> B[UPDATE orders]
+B --> C[INSERT payment_records]
+C --> D[INSERT outbox_events]
+D --> E[pgx COMMIT]
+```
+
+Never use async commit for `payment_records` or `outbox_events`. The `~10ms` window where data is in memory but not flushed means a power failure could lose a financial write.
+
+### Postgres Read replica
+
+```mermaid
+flowchart LR
+A[Primary WAL] --> B[streaming replication]
+B --> C[Replica]
+C --> D[pgxpool ReadDB] 
+D --> E[analytics queries]
+```
+
+A second `pgxpool` connection string pointing at the replica. The application layer routes all `SELECT-only` queries (dashboards, reports, admin views) to the replica-pool - keeping the primary free for writes.
+
+The replica rejects writes at the storage level. Routing is forced in the Go servicelayer: a `ReadDB` and `WriteDB` pool, with code review enforcing which queries go where.
+
+### Redis Cluster
+```mermaid
+flowchart LR
+    A[Request] --> B["rdb.SetNX(key, val, 24h)"]
+    B -->|true| C[process + store]
+    B -->|false| D[return cached]
+```
+
+The Payment consumer and Order Service both check idempotency keys before any write
+
+```go
+set, err := rdb.SetNX(ctx,
+    "idempotency:"+key,
+    responseJSON,
+    24*time.Hour,
+).Result()
+// set=true  → first time, proceed
+// set=false → duplicate, return cached response
+```
+
+### Outbox Relay
+
+```mermaid
+flowchart LR
+A[Application pgx.COMMIT] --> B[Postgres WAL Record]
+B --> C["Go outbox Relay (pglogrepl)"]
+C --> D["Google Pub/Sub Publish"]
+```
+
+Instead of using Debezium, we use `jackc/pglogrepl` for the go-native outbox relay. It runs independently as a background worker. The relay establishes a logical replication stream with PostgresSQL, tailing the WAL directly, and publishes those events to Google Pub/Sub.
+
+The `outbox_events` table is written atomically inside standard application database transactions. Once `pgx COMMIT` is issued and postgres writes it to disk, go relay guarantees it will eventually catch the change and publish it - even if the relay crashes or restarts mid-flight. 
+
+### Google Pub/Sub
+```mermaid
+flowchart LR
+A[Outbox Relay] --> B[Pub/Sub topic]
+B --> C[Websocket GW subscription]
+C --> D[Webhook Fanout subscription]
+```
+
+The websocket gateway and websocket fanout are both subscribers. Ordering keys (set to `order_id`) preserve event sequence per order across the async delivery boundary.
+
+### Websocket Gateway
+
+```mermaid
+flowchart LR
+A[Pub/Sub pull] --> B[route by customer_id]
+B --> C[chan message]
+C --> D["websocket.Write()"]
+D --> E[client app]
+```
+
+An http server using `nhooyr.io/websocket` (idiomatic Go, context-aware). Each active client connection gets a goroutine. Go's goroutine scheduler handles tens of thousands of concurrent connections on a single binary
+
+```go
+conn, _ := websocket.Accept(w, r, nil)
+// goroutine per connection:
+go func() {
+    for msg := range customerChan[customerID] {
+        conn.Write(ctx, websocket.MessageText, msg)
+    }
+}()
+```
+
+A pub/sub pull subscriber routes messages to the right channel by `customer_id`. End-to-End: Postgres `COMMIT -> WAL -> Outbox relay -> Pub/Sub -> Websocket push` ~100-150ms.
+
+### Webhook Fanout
+```mermaid
+flowchart LR
+    A[Pub/Sub message] --> B["gobreaker.Execute()"]
+    B --> C{http.Post to endpoint}
+    C -- 200 OK --> D[Ack Message]
+    C -- Non-200 / Error --> E["backoff.Retry()"]
+    E --> B
+```
+
+Deliver HTTP POST callbacks to third party systems. Retry logic uses exponential backoff. Per endpoint circuit breaking .
+
+```go
+op := func() error {
+    resp, err := http.Post(endpoint, "application/json", body)
+    if err != nil || resp.StatusCode >= 500 {
+        return backoff.Permanent(err) // or retryable
+    }
+    return nil
+}
+backoff.Retry(op, backoff.NewExponentialBackOff())
+```
+
+Every payload is signed with HMAC-SHA256 using `crypto/hmac`.
+
+### OpenTelemetry + Jaeger
+
+```mermaid
+flowchart LR
+    A[otel middleware] --> B[span per request]
+    B --> C[context.Context carries trace]
+    C --> D[OTel collector]
+    D --> E[Jaeger UI]
+```
+
+HTTP middleware auto-instruments via `otelhttp.NewHandler()`. Kafka spans are created manually or via `otelkafka` contrib package.
+
+```go
+// HTTP auto-instrument
+mux := chi.NewRouter()
+mux.Use(otelchi.Middleware("order-service"))
+
+// Manual span
+ctx, span := tracer.Start(ctx, "razorpay.capture")
+defer span.End()
+// ... call Razorpay
+span.SetAttributes(attribute.String("order_id", id))
+```
+
+Trace context propagates via W3C headers on HTTP and via Kafka message headers across the async boundary. One trace ID spans the entire order journey from API Gateway to Websocket push.
+
+### Prometheus + Grafana 
+
+```mermaid
+flowchart LR
+
+A[promauto registers metrics] --> B[Prometheus scrapes / metrics]
+B --> C[Grafana SLO dashboards]
+C --> D[burn rate alert]
+D --> E[PagerDuty]
+```
+
+Every go binary exposes `/metrics` on a dedicated port. `promauto` makes registration one-liners:
+```go
+var orderLatency = promauto.NewHistogramVec(
+    prometheus.HistogramOpts{
+        Name:    "order_creation_duration_seconds",
+        Buckets: prometheus.DefBuckets,
+    },
+    []string{"status"},
+)
+```
+
+1. P99 order creation  `<200ms`
+2. P99 payment processing `<2s`
+3. Status push to client `<500ms`
+4. Kafka consumer lag `alert >10k`
+5. Razorpay capture lag `alert >1h uncaptured`
+
+New SLO for Razorpay: alert when any authorized payment is uncaptured for more than 1 hour. This gives 4.9 days of buffer before the 5-day auto-refund window closes.
